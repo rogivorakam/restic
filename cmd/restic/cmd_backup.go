@@ -102,6 +102,8 @@ type BackupOptions struct {
 	FilesFrom         []string
 	FilesFromVerbatim []string
 	FilesFromRaw      []string
+	Paths             []string
+	PathsFrom         []string
 	TimeStamp         string
 	WithAtime         bool
 	IgnoreInode       bool
@@ -134,11 +136,16 @@ func init() {
 	f.StringVar(&backupOptions.ExcludeLargerThan, "exclude-larger-than", "", "max `size` of the files to be backed up (allowed suffixes: k/K, m/M, g/G, t/T)")
 	f.BoolVar(&backupOptions.Stdin, "stdin", false, "read backup from stdin")
 	f.StringVar(&backupOptions.StdinFilename, "stdin-filename", "stdin", "`filename` to use when reading from stdin")
+	err := f.MarkDeprecated("stdin-filename", "use --set-path")
+	if err != nil {
+		// MarkDeprecated only returns an error when the flag could not be found
+		panic(err)
+	}
 	f.Var(&backupOptions.Tags, "tag", "add `tags` for the new snapshot in the format `tag[,tag,...]` (can be specified multiple times)")
 	f.UintVar(&backupOptions.ReadConcurrency, "read-concurrency", 0, "read `n` files concurrently (default: $RESTIC_READ_CONCURRENCY or 2)")
 	f.StringVarP(&backupOptions.Host, "host", "H", "", "set the `hostname` for the snapshot manually. To prevent an expensive rescan use the \"parent\" flag")
 	f.StringVar(&backupOptions.Host, "hostname", "", "set the `hostname` for the snapshot manually")
-	err := f.MarkDeprecated("hostname", "use --host")
+	err = f.MarkDeprecated("hostname", "use --host")
 	if err != nil {
 		// MarkDeprecated only returns an error when the flag could not be found
 		panic(err)
@@ -146,6 +153,8 @@ func init() {
 	f.StringArrayVar(&backupOptions.FilesFrom, "files-from", nil, "read the files to backup from `file` (can be combined with file args; can be specified multiple times)")
 	f.StringArrayVar(&backupOptions.FilesFromVerbatim, "files-from-verbatim", nil, "read the files to backup from `file` (can be combined with file args; can be specified multiple times)")
 	f.StringArrayVar(&backupOptions.FilesFromRaw, "files-from-raw", nil, "read the files to backup from `file` (can be combined with file args; can be specified multiple times)")
+	f.StringArrayVar(&backupOptions.Paths, "set-path", nil, "manually set the `path` of snapshot (default: paths to backup; can be specified multiple times)")
+	f.StringArrayVar(&backupOptions.PathsFrom, "set-path-from", nil, "read the path(s) to set from `file` (can be combined with --set-path; can be specified multiple times)")
 	f.StringVar(&backupOptions.TimeStamp, "time", "", "`time` of the backup (ex. '2012-11-01 22:08:41') (default: now)")
 	f.BoolVar(&backupOptions.WithAtime, "with-atime", false, "store the atime for all files and directories")
 	f.BoolVar(&backupOptions.IgnoreInode, "ignore-inode", false, "ignore inode number changes when checking for modified files")
@@ -279,7 +288,7 @@ func (opts BackupOptions) Check(gopts GlobalOptions, args []string) error {
 			return errors.Fatal("cannot read both password and data from stdin")
 		}
 
-		filesFrom := append(append(opts.FilesFrom, opts.FilesFromVerbatim...), opts.FilesFromRaw...)
+		filesFrom := append(append(append(opts.FilesFrom, opts.FilesFromVerbatim...), opts.FilesFromRaw...), opts.PathsFrom...)
 		for _, filename := range filesFrom {
 			if filename == "-" {
 				return errors.Fatal("unable to read password from stdin when data is to be read from stdin, use --password-file or $RESTIC_PASSWORD")
@@ -297,7 +306,12 @@ func (opts BackupOptions) Check(gopts GlobalOptions, args []string) error {
 		if len(opts.FilesFromRaw) > 0 {
 			return errors.Fatal("--stdin and --files-from-raw cannot be used together")
 		}
-
+		if len(opts.Paths) > 0 {
+			return errors.Fatal("--stdin and --set-path cannot be used together")
+		}
+		if len(opts.PathsFrom) > 0 {
+			return errors.Fatal("--stdin and --set-paths-from cannot be used together")
+		}
 		if len(args) > 0 {
 			return errors.Fatal("--stdin was specified and files/dirs were listed as arguments")
 		}
@@ -472,6 +486,19 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts GlobalOptions, ter
 		return err
 	}
 
+	for _, file := range opts.PathsFrom {
+		fromfile, err := readLines(file)
+		if err != nil {
+			return err
+		}
+		opts.Paths = append(opts.Paths, fromfile...)
+	}
+
+	// set snapshot paths to targets if not given explicitely
+	if len(opts.Paths) == 0 {
+		opts.Paths = targets
+	}
+
 	timeStamp := time.Now()
 	if opts.TimeStamp != "" {
 		timeStamp, err = time.ParseInLocation(TimeFormat, opts.TimeStamp, time.Local)
@@ -526,7 +553,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts GlobalOptions, ter
 
 	var parentSnapshot *restic.Snapshot
 	if !opts.Stdin {
-		parentSnapshot, err = findParentSnapshot(ctx, repo, opts, targets, timeStamp)
+		parentSnapshot, err = findParentSnapshot(ctx, repo, opts, opts.Paths, timeStamp)
 		if err != nil {
 			return err
 		}
@@ -645,6 +672,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts GlobalOptions, ter
 		Time:           timeStamp,
 		Hostname:       opts.Host,
 		ParentSnapshot: parentSnapshot,
+		Paths:          opts.Paths,
 	}
 
 	if !gopts.JSON {
